@@ -1,10 +1,8 @@
 //
 // raft.go
 // =======
-// Write your code in this file
-// We will use the original version of all other
-// files for testing
-//
+// Implements multiple Raft peers to form a Raft consensus cluster
+// Implements leader election, log replication, and safety properties
 
 package raft
 
@@ -30,21 +28,12 @@ const kLogToStdout = true
 // Change this to output logs to a different directory
 const kLogOutputDir = "./raftlogs/"
 
+const HeartbeatInterval = 100 // in milliseconds
+
 const (
 	ElectionTimeoutMin = 300 // in milliseconds
 	ElectionTimeoutMax = 600 // in milliseconds
 )
-
-// ApplyCommand
-// ========
-//
-// As each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyCommand to the service (or
-// tester) on the same server, via the applyCh passed to NewPeer()
-type ApplyCommand struct {
-	Index   int
-	Command interface{}
-}
 
 // Define server roles
 type serverRole int
@@ -54,15 +43,6 @@ const (
 	Candidate
 	Leader
 )
-
-// LogEntry
-// ========
-//
-// A single log entry
-type LogEntry struct {
-	Term    int
-	Command interface{}
-}
 
 // candidateVoteCnt
 // =================
@@ -74,45 +54,53 @@ type candidateVoteCnt struct {
 	voteMux sync.Mutex
 }
 
+type ApplyCommand struct {
+	Index   int
+	Command interface{}
+}
+
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
+
 // Raft struct
 // ===========
-//
-// A Go object implementing a single Raft peer
 type Raft struct {
-	mux   sync.Mutex       // Lock to protect shared access to this peer's state
-	peers []*rpc.ClientEnd // RPC end points of all peers
-	me    int              // this peer's index into peers[]
-	// You are expected to create reasonably clear log files before asking a
-	// debugging question on Edstem or OH. Use of this logger is optional, and
-	// you are free to remove it completely.
-	logger *log.Logger // We provide you with a separate logger per peer.
+	// Rpc peers
+	mux   *sync.Mutex
+	peers []*rpc.ClientEnd
+	me    int
 
-	// Look at the Raft paper's Figure 2 for a description of what
-	// state a Raft peer should maintain
-	// Persistent state on all servers:
-	currentTerm int        // latest term server has seen
-	votedFor    int        // candidateId that received vote in current term
-	log         []LogEntry // log entries
+	// Logger
+	logger *log.Logger
 
-	// Volatile state on all servers:
-	commitIndex int // index of highest log entry known to be committed
-	lastApplied int // index of highest log entry applied to state machine
+	// Persistent State on Server
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
 
-	// Volatile state on leaders: Reinitialized after election
-	nextIndex  []int // for each server, index of the next log entry to send to that server
-	matchIndex []int // for each server, index of highest log entry known to be replicated on server
+	// Volatile State on Server
+	commitIndex int
+	lastApplied int
 
-	role serverRole
-	// shutdown channel
-	shutdown chan struct{}
+	// Volatile State on Leaders
+	nextIndex  []int
+	matchIndex []int
 
-	// timing parameters
+	// Timer
 	lastHeartbeat     time.Time
 	heartbeatInterval time.Duration
 	electionTimeout   time.Duration
 
-	// apply channel
+	// Role
+	role serverRole
+
+	// Apply channel
 	applyCh chan ApplyCommand
+
+	// Shutdown channel
+	shutdown chan struct{}
 }
 
 // GetState
@@ -133,12 +121,6 @@ func (rf *Raft) GetState() (int, int, bool) {
 	return me, term, isLeader
 }
 
-// RequestVoteArgs
-// ===============
-//
-// Example RequestVote RPC arguments structure.
-//
-// # Please note: Field names must start with capital letters!
 type RequestVoteArgs struct {
 	Term         int // candidate’s term
 	CandidateId  int // candidate requesting vote
@@ -148,72 +130,58 @@ type RequestVoteArgs struct {
 
 // RequestVoteReply
 // ================
-//
-// Example RequestVote RPC reply structure.
-//
-// # Please note: Field names must start with capital letters!
 type RequestVoteReply struct {
-	Term        int  // currentTerm, for candidate to update itself
-	VoteGranted bool // true means candidate received vote
+	Term        int
+	VoteGranted bool
 }
 
 // AppendEntriesArgs
 // =================
-//
-// Example AppendEntries RPC arguments structure.
 type AppendEntriesArgs struct {
-	Term         int        // Leader's term
-	LeaderId     int        // So follower can redirect clients
-	PrevLogIndex int        // Index of log entry immediately preceding new ones
-	PrevLogTerm  int        // Term of prevLogIndex entry
-	Entries      []LogEntry // Log entries to store (empty for heartbeat)
-	LeaderCommit int        // Leader's commitIndex
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 // AppendEntriesReply
 // ==================
-//
-// Example AppendEntries RPC reply structure.
 type AppendEntriesReply struct {
-	Term    int  // CurrentTerm, for leader to update itself
-	Success bool // True if follower contained entry matching prevLogIndex and prevLogTerm
+	Term    int
+	Success bool
 }
 
 // RequestVote
 // ===========
-//
-// Example RequestVote RPC handler
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// require lock
+	// Acquire lock
 	rf.mux.Lock()
 	defer rf.mux.Unlock()
 
+	// Reply false if term < currentTerm (§5.1)
 	if args.Term < rf.currentTerm {
-		// Reply false if term < currentTerm (§5.1)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
 	// If RPC request or response contains term T > currentTerm:
-	// voteFor depend on log up-to-date check
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.role = Follower // convert to follower if exist higher term
-		rf.votedFor = -1
+		rf.changeToFollower(args.Term)
 	}
-	reply.Term = rf.currentTerm
+	reply.Term = rf.currentTerm // set reply term
 
-	// If votedFor is null or candidateId, and candidate’s log is at
-	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isCandidateLogUpToDate(args.LastLogIndex, args.LastLogTerm) {
-		rf.votedFor = args.CandidateId
+		// Grant vote
 		reply.VoteGranted = true
-		// Reset election timer
 		rf.lastHeartbeat = time.Now()
 	} else {
+		// Deny vote
 		reply.VoteGranted = false
 	}
+
 }
 
 // A candidate's log is considered at least as up-to-date as
@@ -239,8 +207,6 @@ func (rf *Raft) isCandidateLogUpToDate(candidateLastLogIndex int, candidateLastL
 
 // AppendEntries
 // =============
-//
-// Example AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// require lock
 	rf.mux.Lock()
@@ -259,38 +225,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 	}
 
-	// Convert to follower if we receive AppendEntries from valid leader
+	// Change To Follower
 	rf.role = Follower
-	rf.lastHeartbeat = time.Now() // Reset election timer
+	rf.lastHeartbeat = time.Now()
 	reply.Term = rf.currentTerm
 
-	// Reply false if log doesn't contain an entry at prevLogIndex
-	// whose term matches prevLogTerm (§5.3)
-	// check the log consistency
-	if args.PrevLogIndex > 0 {
-		if args.PrevLogIndex >= len(rf.log) {
-			reply.Success = false
-			return
-		}
-		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			reply.Success = false
-			return
-		}
+	// Check Log Consistency
+	if args.PrevLogIndex >= len(rf.log) ||
+		(args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		// Log inconsistency
+		reply.Success = false
+		return
 	}
 
-	// If an existing entry conflicts with a new one (same index but
-	// different terms), delete the existing entry and all that follow (§5.3)
-	// Append any new entries not already in the log (§5.3)
+	// Exist New entries to append
 	if len(args.Entries) > 0 {
-		// Directly overwrite from PrevLogIndex+1
+		// Append any new entries not already in the log
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	}
-
-	//  If leaderCommit > commitIndex, set commitIndex =
-	//  min(leaderCommit, index of last new entry)
+	// Update commitIndex
 	if args.LeaderCommit > rf.commitIndex {
-		// Only advance commitIndex to entries that have been verified consistent
-		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
 
 	reply.Success = true
@@ -412,11 +367,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader
 func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 	rf.mux.Lock()
+	defer rf.mux.Unlock()
 	index := -1
 	term := -1
 	isLeader := rf.role == Leader
 	if !isLeader {
-		rf.mux.Unlock()
 		return index, term, isLeader
 	}
 
@@ -429,13 +384,12 @@ func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, newLogEntry)
 	index = len(rf.log) - 1
 
-	// Start log replication to all followers
-	for i := range rf.peers {
-		if i != rf.me {
-			go rf.replicateLog(i)
+	// Start log replication to followers
+	for peer := range rf.peers {
+		if peer != rf.me {
+			go rf.replicateLog(peer)
 		}
 	}
-	rf.mux.Unlock()
 	return index, term, isLeader
 }
 
@@ -597,9 +551,7 @@ func (rf *Raft) electionRequestVote(peer int, term int, candidateId int, lastLog
 		}
 		if reply.Term > rf.currentTerm {
 			// Convert to follower if we discover a higher term
-			rf.currentTerm = reply.Term
-			rf.role = Follower
-			rf.votedFor = -1
+			rf.changeToFollower(reply.Term)
 			return
 		}
 
@@ -734,7 +686,7 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) {
 
 		// If found higher term, convert to follower
 		if reply.Term > rf.currentTerm {
-			rf.changeToFollower(reply)
+			rf.changeToFollower(reply.Term)
 			return
 		}
 
@@ -897,8 +849,8 @@ func (rf *Raft) sendHeartbeatsToAll() {
 // =================
 //
 // Convert the current Raft peer to a follower
-func (rf *Raft) changeToFollower(reply *AppendEntriesReply) {
-	rf.currentTerm = reply.Term
+func (rf *Raft) changeToFollower(term int) {
+	rf.currentTerm = term
 	rf.role = Follower
 	rf.votedFor = -1
 }
