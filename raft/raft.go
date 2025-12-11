@@ -31,6 +31,12 @@ const kLogOutputDir = "./raftlogs/"
 const HeartbeatInterval = 100 // in milliseconds
 
 const (
+	ElectionTicker      = 10 // in milliseconds
+	ApplyCommitedTicker = 10
+)
+
+// Election timeout range
+const (
 	ElectionTimeoutMin = 300 // in milliseconds
 	ElectionTimeoutMax = 600 // in milliseconds
 )
@@ -68,7 +74,7 @@ type LogEntry struct {
 // ===========
 type Raft struct {
 	// Rpc peers
-	mux   *sync.Mutex
+	mux   sync.Mutex
 	peers []*rpc.ClientEnd
 	me    int
 
@@ -367,11 +373,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader
 func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 	rf.mux.Lock()
-	defer rf.mux.Unlock()
 	index := -1
 	term := -1
 	isLeader := rf.role == Leader
 	if !isLeader {
+		rf.mux.Unlock()
 		return index, term, isLeader
 	}
 
@@ -384,12 +390,8 @@ func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, newLogEntry)
 	index = len(rf.log) - 1
 
-	// Start log replication to followers
-	for peer := range rf.peers {
-		if peer != rf.me {
-			go rf.replicateLog(peer)
-		}
-	}
+	rf.mux.Unlock()
+	go rf.sendReplicateLogsToAll()
 	return index, term, isLeader
 }
 
@@ -466,7 +468,7 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 	rf.lastHeartbeat = time.Now()
 
 	// Set timing parameters
-	rf.heartbeatInterval = 100 * time.Millisecond // 10 heartbeats per second max
+	rf.heartbeatInterval = HeartbeatInterval * time.Millisecond // 10 heartbeats per second max
 	rf.electionTimeout = rf.randomElectionTimeout()
 
 	// Initialize leader state (will be set when becoming leader)
@@ -488,7 +490,7 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 //
 // Apply committed log entries to the state machine
 func (rf *Raft) applyCommitted() {
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(ApplyCommitedTicker * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -496,29 +498,23 @@ func (rf *Raft) applyCommitted() {
 		case <-ticker.C:
 			rf.mux.Lock()
 
-			// Apply all committed but not yet applied log entries
-			// Process each entry one by one
+			// Apply Commited Entries
 			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
 
-				// Get the entry to apply
 				if rf.lastApplied >= len(rf.log) {
 					// No more entries to apply
 					break
 				}
-
 				entry := rf.log[rf.lastApplied]
 				applyMsg := ApplyCommand{
 					Index:   rf.lastApplied,
 					Command: entry.Command,
 				}
-
 				// Release lock before sending to channel (avoid deadlock)
 				rf.mux.Unlock()
 				rf.applyCh <- applyMsg
-
-				// Re-acquire lock for next iteration
-				rf.mux.Lock()
+				rf.mux.Lock() // Re-acquire lock for next iteration
 			}
 			rf.mux.Unlock()
 
@@ -613,7 +609,7 @@ func (rf *Raft) startElection() {
 //
 // Monitor election timeouts and start elections as needed
 func (rf *Raft) electionTimer() {
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(ElectionTicker * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
@@ -741,6 +737,21 @@ func (rf *Raft) replicateLog(server int) {
 	}
 }
 
+func (rf *Raft) sendReplicateLogsToAll() {
+	rf.mux.Lock()
+	if rf.role != Leader {
+		rf.mux.Unlock()
+		return
+	}
+	rf.mux.Unlock()
+
+	for i := range rf.peers {
+		if i != rf.me {
+			go rf.replicateLog(i)
+		}
+	}
+}
+
 // tryCommitLogEntries
 // ===================
 //
@@ -781,6 +792,7 @@ func (rf *Raft) tryCommitLogEntries() {
 //
 // Convert the current Raft peer to a leader
 func (rf *Raft) becomeLeader() {
+	// Check if still a candidate
 	if rf.role != Candidate {
 		return
 	}
@@ -797,11 +809,7 @@ func (rf *Raft) becomeLeader() {
 	// RPCs (heartbeat) to each server to establish authority and
 	// prevent new elections
 	go rf.sendHeartbeatsToAll()
-	for p := range rf.peers {
-		if p != rf.me {
-			go rf.replicateLog(p)
-		}
-	}
+	go rf.sendReplicateLogsToAll()
 }
 
 // heartbeatTimer
