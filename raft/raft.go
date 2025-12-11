@@ -8,28 +8,6 @@
 
 package raft
 
-//
-// API
-// ===
-// This is an outline of the API that your raft implementation should
-// expose.
-//
-// rf = NewPeer(...)
-//   Create a new Raft server.
-//
-// rf.PutCommand(command interface{}) (index, term, isleader)
-//   PutCommand agreement on a new log entry
-//
-// rf.GetState() (me, term, isLeader)
-//   Ask a Raft peer for "me" (see line 58), its current term, and whether it thinks it
-//   is a leader
-//
-// ApplyCommand
-//   Each time a new entry is committed to the log, each Raft peer
-//   should send an ApplyCommand to the service (e.g. tester) on the
-//   same server, via the applyCh channel passed to NewPeer()
-//
-
 import (
 	"fmt"
 	"io/ioutil"
